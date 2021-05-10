@@ -1,5 +1,6 @@
 package querqy.solr;
 
+import org.apache.solr.common.params.CommonParams;
 import org.apache.solr.common.params.ModifiableSolrParams;
 import org.apache.solr.common.util.ContentStreamBase;
 import org.apache.solr.common.util.NamedList;
@@ -15,6 +16,7 @@ import querqy.solr.rewriter.ClassicConfigurationParser;
 import querqy.solr.utils.ConfigUtils;
 import querqy.solr.utils.JsonUtil;
 
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -32,7 +34,11 @@ public class ClassicRewriteChainLoader extends AbstractSolrEventListener {
 
     private static final Logger LOG = LoggerFactory.getLogger(ClassicRewriteChainLoader.class);
 
+    public static final String CONF_OVERWRITE_EXISTING = "overwriteExisting";
+    public static final boolean DEFAULT_CONF_OVERWRITE_EXISTING = true;
+
     private String rewriterRequestHandlerName;
+    private boolean overwriteExisting;
 
     public ClassicRewriteChainLoader(final SolrCore core) {
         super(core);
@@ -48,6 +54,7 @@ public class ClassicRewriteChainLoader extends AbstractSolrEventListener {
             throw new IllegalArgumentException(CONF_REWRITER_REQUEST_HANDLER + " cannot be empty");
         }
         rewriterRequestHandlerName = name;
+        overwriteExisting = ConfigUtils.getBoolArg(getArgs().asShallowMap(), CONF_OVERWRITE_EXISTING, DEFAULT_CONF_OVERWRITE_EXISTING);
     }
 
     @Override
@@ -83,6 +90,7 @@ public class ClassicRewriteChainLoader extends AbstractSolrEventListener {
                 }
 
                 final Set<String> seenRewriterIds = new HashSet<>(rewriterConfigs.size());
+                final Set<String> existingRewriterIds = getConfiguredRewriters(core);
 
                 for (NamedList<?> config : rewriterConfigs) {
 
@@ -95,32 +103,55 @@ public class ClassicRewriteChainLoader extends AbstractSolrEventListener {
                         throw new RuntimeException("Rewriter id: " + id + "already defined.");
                     }
 
-                    try {
-                        final ModifiableSolrParams params = new ModifiableSolrParams();
-                        params.set(PARAM_ACTION, SAVE.name());
+                    if (overwriteExisting || !existingRewriterIds.contains(id)) {
+                        try {
+                            LOG.info("Uploading Querqy rewrite configuration {}", id);
+                            final ModifiableSolrParams params = new ModifiableSolrParams();
+                            params.set(PARAM_ACTION, SAVE.name());
 
-                        final String className = (String) config.get("class");
+                            final String className = (String) config.get("class");
 
-                        final Map<String, Object> jsonBody = ((ClassicConfigurationParser) SolrRewriterFactoryAdapter
-                                .loadInstance(id, className))
-                                .parseConfigurationToRequestHandlerBody((NamedList<Object>) config, resourceLoader);
+                            final Map<String, Object> jsonBody = ((ClassicConfigurationParser) SolrRewriterFactoryAdapter
+                                    .loadInstance(id, className))
+                                    .parseConfigurationToRequestHandlerBody((NamedList<Object>) config, resourceLoader);
 
-                        final SolrQueryRequestBase req = new SolrQueryRequestBase(core, params) {
-                        };
-                        req.setContentStreams(singleton(new ContentStreamBase.StringStream(JsonUtil.toJson(jsonBody),
-                                UTF_8.name())));
+                            final SolrQueryRequestBase req = new SolrQueryRequestBase(core, params) {
+                            };
+                            req.setContentStreams(singleton(new ContentStreamBase.StringStream(JsonUtil.toJson(jsonBody),
+                                    UTF_8.name())));
 
-                        final SolrQueryResponse response = new SolrQueryResponse();
-                        requestHandler.getSubHandler(id).handleRequest(req, response);
-                        if (response.getException() != null) {
-                            throw new IllegalStateException("Could not upload rewriter " + id, response.getException());
+                            final SolrQueryResponse response = new SolrQueryResponse();
+                            requestHandler.getSubHandler(id).handleRequest(req, response);
+                            if (response.getException() != null) {
+                                throw new IllegalStateException("Could not upload rewriter " + id, response.getException());
+                            }
+                        } catch (final RuntimeException e) {
+                            LOG.error("Could not parse rewrite entry: {}", config, e);
+                            throw e;
                         }
-                    } catch (final RuntimeException e) {
-                        LOG.error("Could not parse rewrite entry: {}", config, e);
-                        throw e;
                     }
                 }
             }
         }
+    }
+
+    private Set<String> getConfiguredRewriters(final SolrCore core) {
+        final QuerqyRewriterRequestHandler requestHandler = (QuerqyRewriterRequestHandler) core
+                .getRequestHandler(rewriterRequestHandlerName);
+
+        final ModifiableSolrParams params = new ModifiableSolrParams();
+        params.set(CommonParams.QT, rewriterRequestHandlerName);
+        final SolrQueryRequestBase req = new SolrQueryRequestBase(core, params) {
+        };
+        final SolrQueryResponse response = new SolrQueryResponse();
+        requestHandler.handleRequest(req, response);
+
+        Set<String> ids = ((Map<String, Map<String, Map<String, ?>>>) response.getResponse()).get("rewriters").keySet();
+
+        if (ids == null) {
+            ids = Collections.emptySet();
+        }
+
+        return ids;
     }
 }
